@@ -1,0 +1,28 @@
+name: Shiksha Gap Filler
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch: {}
+jobs:
+  fill-gaps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+      - name: Fill email gaps for Shiksha colleges
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          SHIKSHA_SHEET_TAB_NAME: "Sheet2"
+          SHIKSHA_GAP_FILLER_MAX_ROWS: "1000"
+        run: python gap_filler_shiksha.py
