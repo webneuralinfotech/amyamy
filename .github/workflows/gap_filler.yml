@@ -23,5 +23,5 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
-          MAX_DAYS_BACK: "1"
+          GAP_FILLER_MAX_DAYS_BACK: "5"
         run: python gap_filler.py
