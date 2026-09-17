@@ -1,0 +1,27 @@
+name: Company Gap Filler
+on:
+  schedule:
+    - cron: "30 0 * * *"
+  workflow_dispatch: {}
+jobs:
+  fill-gaps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+      - name: Fill gaps using Serper Search
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          MAX_DAYS_BACK: "1"
+        run: python gap_filler.py
