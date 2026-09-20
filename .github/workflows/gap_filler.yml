@@ -6,7 +6,8 @@ on:
 jobs:
   fill-gaps:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    # AMI Dev - Sep 2026 - Timeout cut from 350 to 60 minutes so GitHub kills the run itself if anything goes wrong, protecting the free Actions minutes.
+    timeout-minutes: 60
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,5 +24,10 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
-          GAP_FILLER_MAX_DAYS_BACK: "5"
+          # AMI Dev - Sep 2026 - Changed from 5 to 2 days. Newest company day plus the day before it.
+          GAP_FILLER_MAX_DAYS_BACK: "2"
+          # AMI Dev - Sep 2026 - Hard safety limits, also enforced inside gap_filler.py.
+          GAP_FILLER_MAX_ROWS_PER_RUN: "250"
+          GAP_FILLER_MAX_RUN_MINUTES: "50"
+          GAP_FILLER_MAX_SECONDS_PER_COMPANY: "120"
         run: python gap_filler.py
