@@ -1,57 +1,39 @@
 """
-Company Gap-Filler
---------------------
+Company Gap Filler
+AMI Dev - Sep 2026 - Full rewrite with hard run limits.
+
 Goes through the Google Sheet and finds rows where Website or Email is
 missing (says "N/A" or "Not found"). For each of those, searches Google
-(via Serper.dev, a legal Google-results API) for the company name, grabs
+(via Serper.dev, a legal Google results API) for the company name, grabs
 their real website from the top result, then crawls that site's own
 navigation links looking for a public email address anywhere on the
-site - header, footer, body, contact page, about page, wherever it is.
+site: header, footer, body, contact page, about page, wherever it is.
 
-Uses a two-stage approach for reading each page:
-  1. Fast plain-HTML fetch (requests) - works for most normal sites.
-  2. If that finds nothing, falls back to a real headless browser
-     (Playwright) that actually runs the site's JavaScript - needed for
-     modern JS-built sites (React/Next.js/Vue) where the real content,
-     including emails, doesn't exist in the raw HTML at all.
-
-This runs as a SEPARATE step from the main scraper, after it, so the
-main scraper's job stays focused on Internshala/HelloIntern only.
+Two stage reading of each page:
+  1. Fast plain HTML fetch (requests), works for most normal sites.
+  2. If that finds nothing, a real headless browser (Playwright) that
+     runs the site's JavaScript, needed for modern JS built sites where
+     the real content does not exist in the raw HTML at all.
 
 Sheet column order must match: Company Name | Website | Email |
 Internship URL | Date/Time Scraped | Internshala Company Page
 
---------------------
-BULLETPROOF UPDATE:
-The script used to crash and stop completely if ANY single step failed
-- for example a temporary Google Sheets connection drop, a browser
-crash, or an unexpected error on one company's website. That meant one
-bad row could stop hundreds of good rows behind it from ever being
-processed.
+BULLETPROOF BEHAVIOUR (kept from the earlier version):
+  Saving to Google Sheets retries 3 times before giving up on one row.
+  Each company is processed inside its own try/except, so one bad
+  company never stops the run.
+  If the browser crashes, it is restarted automatically.
+  Website search and page fetches get one automatic retry.
 
-This version wraps every risky operation in retries and safety nets:
-  - Saving to Google Sheets retries 3 times before giving up on that
-    one row (fixes the SSLEOFError connection-drop crash).
-  - Each company is processed inside its own try/except - if anything
-    goes wrong on one company, it's logged and the script moves on to
-    the next company instead of stopping.
-  - If the browser itself crashes, it's automatically restarted so the
-    run can continue instead of dying.
-  - Website search and page fetches also get one automatic retry before
-    being treated as "not found" for that company.
-
---------------------
-AMI Dev - Aug 2026 - DATE CUTOFF UPDATE:
-Only ~50-100 real companies exist right now, but this script was
-re-checking an old historical backlog of unresolved gaps every single
-day, which burned through the entire monthly GitHub Actions budget in
-one run (3+ hours).
-
-The sheet is processed newest-first (bottom to top). This version reads
-each row's "Date/Time Scraped" column and stops the ENTIRE run the
-moment it reaches a company older than MAX_DAYS_BACK days (default 2)
-- it does not continue upward through the older backlog at all. This
-keeps each run fast and cheap, only covering genuinely new companies.
+AMI Dev - Sep 2026 - WHAT CHANGED IN THIS VERSION:
+  1. The date cutoff is anchored to the date of the NEWEST company row
+     in the sheet, not to today's date. Example: newest company was
+     added on 20 Sep and MAX_DAYS_BACK is 2, so only 20 Sep and 19 Sep
+     rows are processed, then the run stops.
+  2. A hard limit on how many rows a run may examine.
+  3. A hard limit on total run minutes.
+  4. A time limit per company so one slow site cannot eat the run.
+  5. More date formats are understood when reading Date/Time Scraped.
 """
 
 import os
@@ -80,11 +62,19 @@ PLAYWRIGHT_TIMEOUT_MS = 15000
 MAX_RETRIES = 3
 RETRY_WAIT_SECONDS = 5
 
-# AMI Dev - Aug 2026 - Only companies added within the last N days are
-# processed. Since the sheet is processed newest-first (bottom to top),
-# the run stops entirely the moment it reaches a row older than this
-# cutoff, instead of grinding through the whole historical sheet daily.
+# AMI Dev - Sep 2026 - Number of days to cover, counting the day of the
+# newest company row as day one. With the value 2, the newest day and the
+# day before it are processed, then the run stops.
 MAX_DAYS_BACK = int(os.environ.get("GAP_FILLER_MAX_DAYS_BACK", "2"))
+
+# AMI Dev - Sep 2026 - Hard safety limits so a run can never go on for hours.
+# Rows are counted as examined even when they need no gap filling.
+MAX_ROWS_PER_RUN = int(os.environ.get("GAP_FILLER_MAX_ROWS_PER_RUN", "250"))
+MAX_RUN_MINUTES = int(os.environ.get("GAP_FILLER_MAX_RUN_MINUTES", "50"))
+
+# AMI Dev - Sep 2026 - Maximum seconds spent crawling one company website
+# before giving up on it and moving to the next company.
+MAX_SECONDS_PER_COMPANY = int(os.environ.get("GAP_FILLER_MAX_SECONDS_PER_COMPANY", "120"))
 
 HEADERS = {
     "User-Agent": (
@@ -102,14 +92,14 @@ EMAIL_BLOCKLIST_DOMAINS = (
 )
 
 # Words that suggest a link leads to a page likely to contain contact info.
-# Used to PRIORITIZE which internal links to visit first - not a strict
-# whitelist, since we fall back to crawling any internal link if needed.
+# Used to PRIORITIZE which internal links to visit first. This is not a
+# strict whitelist, since we fall back to crawling any internal link.
 PRIORITY_LINK_KEYWORDS = (
     "contact", "about", "reach", "connect", "touch", "support",
     "help", "team", "office", "location",
 )
 
-# Domains that are never a real company's own website - job boards,
+# Domains that are never a real company's own website: job boards,
 # directories, data aggregators, download sites, social platforms, etc.
 NON_COMPANY_DOMAINS = (
     "linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
@@ -122,8 +112,8 @@ NON_COMPANY_DOMAINS = (
     "play.google.com", "apps.apple.com", "amazon.com", "amazon.in",
     "flipkart.com", "pharmeasy.in", "1mg.com", "netmeds.com",
     "linktr.ee", "bit.ly", "tinyurl.com",
-    # Trade registries, business data aggregators, and directory sites -
-    # these list company info but are never the company's own website
+    # Trade registries, business data aggregators, and directory sites.
+    # These list company info but are never the company's own website.
     "zaubacorp.com", "f6s.com", "falconebiz.com", "zoominfo.com",
     "planetexim.net", "find-and-update.company-information.service.gov.uk",
     "company-information.service.gov.uk", "indiamart.com",
@@ -152,13 +142,12 @@ def get_all_rows(sheets_service):
 
 def update_row(sheets_service, row_number, website, email):
     """
-    Saves the website/email for one row into the Google Sheet.
+    Saves the website and email for one row into the Google Sheet.
 
     BULLETPROOF: retries up to MAX_RETRIES times if the connection to
-    Google drops mid-request (the exact issue that crashed the last
-    run - ssl.SSLEOFError). Waits a few seconds between attempts to let
-    any temporary network issue clear up. If it still fails after all
-    retries, it logs the failure and lets the script continue to the
+    Google drops mid request. Waits a few seconds between attempts to
+    let any temporary network issue clear up. If it still fails after
+    all retries, it logs the failure and lets the script continue to the
     next company instead of crashing the entire run.
     """
     body = {"values": [[website, email]]}
@@ -177,7 +166,7 @@ def update_row(sheets_service, row_number, website, email):
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_WAIT_SECONDS)
 
-    print(f"  [error] Could not save row {row_number} after {MAX_RETRIES} attempts - skipping this row, continuing run.", file=sys.stderr)
+    print(f"  [error] Could not save row {row_number} after {MAX_RETRIES} attempts. Skipping this row and continuing the run.", file=sys.stderr)
     return False
 
 
@@ -188,6 +177,7 @@ def search_company_website(company_name):
 
     BULLETPROOF: retries once on any network error before giving up.
     """
+    result = {}
     for attempt in range(1, 3):
         try:
             resp = requests.post(
@@ -223,8 +213,8 @@ def clean_email_list(raw_emails, allowed_domain=None):
     for email in raw_emails:
         email_clean = email.lower().strip().strip(".").strip(",")
 
-        # Strip an accidentally-attached URL prefix (e.g. a broken
-        # "http://name@domain.com" scraped from a malformed link)
+        # Strip an accidentally attached URL prefix (for example a broken
+        # "http://name@domain.com" scraped from a malformed link).
         for prefix in ("http://", "https://"):
             if email_clean.startswith(prefix):
                 email_clean = email_clean[len(prefix):]
@@ -242,15 +232,15 @@ def clean_email_list(raw_emails, allowed_domain=None):
         seen.add(email_clean)
         cleaned.append(email_clean)
 
-    # If we know the company's own domain, prefer emails that match it -
-    # this stops picking up a stray email from an ad/widget/embed that
+    # If we know the company's own domain, prefer emails that match it.
+    # This stops picking up a stray email from an ad, widget or embed that
     # belongs to a completely different company.
     if allowed_domain and cleaned:
         matching = [e for e in cleaned if e.endswith("@" + allowed_domain) or allowed_domain in e.split("@")[-1]]
         if matching:
             return matching
-        # No exact domain match found - still return candidates, since a
-        # company sometimes legitimately uses a Gmail/Outlook address.
+        # No exact domain match found. Still return candidates, since a
+        # company sometimes legitimately uses a Gmail or Outlook address.
         generic_providers = ("gmail.com", "outlook.com", "yahoo.com", "hotmail.com", "rediffmail.com")
         generic = [e for e in cleaned if e.split("@")[-1] in generic_providers]
         return generic if generic else cleaned
@@ -259,7 +249,7 @@ def clean_email_list(raw_emails, allowed_domain=None):
 
 
 def extract_emails_from_html(html, allowed_domain=None):
-    """Scans the FULL page - header, footer, body, everywhere - for emails."""
+    """Scans the FULL page (header, footer, body, everywhere) for emails."""
     soup = BeautifulSoup(html, "html.parser")
 
     mailto_emails = [
@@ -276,10 +266,10 @@ def extract_emails_from_html(html, allowed_domain=None):
 
 def get_internal_links(html, base_url):
     """
-    Pulls every internal link from a page's actual navigation/footer -
-    not a guessed list of page names. Returns them ranked so
-    contact/about-style pages are tried first, but ANY internal link
-    is included as a fallback.
+    Pulls every internal link from a page's actual navigation and footer,
+    not a guessed list of page names. Returns them ranked so contact and
+    about style pages are tried first, but ANY internal link is included
+    as a fallback.
     """
     soup = BeautifulSoup(html, "html.parser")
     base_domain = urlparse(base_url).netloc
@@ -314,7 +304,7 @@ def get_internal_links(html, base_url):
 
 
 def fetch_with_requests(url):
-    """Fast plain-HTML fetch. Returns (html, final_url) or (None, None)."""
+    """Fast plain HTML fetch. Returns (html, final_url) or (None, None)."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
         if resp.status_code != 200:
@@ -324,21 +314,25 @@ def fetch_with_requests(url):
         return None, None
 
 
+class BrowserDeadError(Exception):
+    """Raised when the Playwright browser process itself has crashed."""
+    pass
+
+
 def fetch_with_playwright(url, browser):
     """
-    Real headless browser fetch - runs the page's JavaScript like a
-    normal visitor's browser would, then returns the fully-built HTML.
-    Needed for modern JS-built sites (React/Next.js/Vue/Wix) where the
-    raw HTML is just an empty shell before JavaScript runs.
+    Real headless browser fetch. Runs the page's JavaScript like a normal
+    visitor's browser would, then returns the fully built HTML. Needed
+    for modern JS built sites (React, Next.js, Vue, Wix) where the raw
+    HTML is just an empty shell before JavaScript runs.
 
-    Uses "domcontentloaded" instead of "networkidle" - waits for the
-    real page content to be ready, not for every tracking script, ad,
-    or chat widget to finish loading in the background. Much faster and
-    avoids timing out on sites that never go fully idle.
+    Uses "domcontentloaded" instead of "networkidle". It waits for the
+    real page content to be ready, not for every tracking script, ad or
+    chat widget to finish loading in the background.
 
-    BULLETPROOF: if the browser itself has crashed/died, this raises a
-    special signal (BrowserDeadError) so the caller can restart it,
-    instead of the whole script dying.
+    BULLETPROOF: if the browser itself has crashed, this raises
+    BrowserDeadError so the caller can restart it instead of the whole
+    script dying.
     """
     page = None
     try:
@@ -364,14 +358,9 @@ def fetch_with_playwright(url, browser):
         return None, None
 
 
-class BrowserDeadError(Exception):
-    """Raised when the Playwright browser process itself has crashed."""
-    pass
-
-
 # Sites known to be permanently broken, blocking, or extremely slow to
-# load - skip these entirely rather than wasting a Playwright timeout
-# on them every single run.
+# load. Skip these entirely rather than wasting a Playwright timeout on
+# them every single run.
 SKIP_SITES_ENTIRELY = (
     "justdial.com",
 )
@@ -380,18 +369,19 @@ SKIP_SITES_ENTIRELY = (
 def find_email_on_site(website_url, browser):
     """
     Universal email finder with two stages per page:
-      1. Fast plain-HTML fetch (requests) - works for most sites.
-      2. If nothing found, real headless browser (Playwright) - catches
-         modern JS-built sites where content only appears after
+      1. Fast plain HTML fetch (requests), works for most sites.
+      2. If nothing found, real headless browser (Playwright), which
+         catches modern JS built sites where content only appears after
          JavaScript runs.
 
     Visits the homepage first, then follows the site's own real internal
-    links - prioritizing contact/about-style pages, falling back to any
-    internal link - until an email is found or MAX_PAGES_PER_SITE is hit.
+    links, prioritizing contact and about style pages, falling back to
+    any internal link, until an email is found, MAX_PAGES_PER_SITE is
+    hit, or MAX_SECONDS_PER_COMPANY is used up.
 
-    BULLETPROOF: lets BrowserDeadError bubble up to main() so the
-    browser can be restarted; any other error just means "no email
-    found on this site" instead of crashing.
+    BULLETPROOF: lets BrowserDeadError bubble up to main() so the browser
+    can be restarted. Any other error just means no email found on this
+    site instead of crashing.
     """
     if not website_url:
         return None
@@ -400,9 +390,12 @@ def find_email_on_site(website_url, browser):
         print(f"  [skip] Site is in SKIP_SITES_ENTIRELY list, not attempting: {website_url}")
         return None
 
+    # AMI Dev - Sep 2026 - Start of the time budget for this one company.
+    site_started_at = time.time()
+
     allowed_domain = urlparse(website_url).netloc.replace("www.", "")
 
-    # --- Homepage ---
+    # Homepage
     html, final_url = fetch_with_requests(website_url)
 
     candidates = extract_emails_from_html(html, allowed_domain) if html else []
@@ -421,6 +414,11 @@ def find_email_on_site(website_url, browser):
     links_to_visit = get_internal_links(html, final_url)[:MAX_PAGES_PER_SITE]
 
     for link in links_to_visit:
+        # AMI Dev - Sep 2026 - Give up on this company if its time budget is used up.
+        if (time.time() - site_started_at) > MAX_SECONDS_PER_COMPANY:
+            print(f"  [skip] Time limit of {MAX_SECONDS_PER_COMPANY} seconds reached for this company site. Moving on.")
+            return None
+
         time.sleep(REQUEST_DELAY_SECONDS)
 
         page_html, _ = fetch_with_requests(link)
@@ -439,40 +437,53 @@ def find_email_on_site(website_url, browser):
 
 def parse_scraped_date(raw_value):
     """
-    Parses the "Date/Time Scraped" column value. Tries a few common
-    formats since the exact format used by the main scraper isn't
-    guaranteed here. Returns a datetime, or None if it can't be parsed
-    (in which case the caller treats the row as recent, to be safe,
-    rather than accidentally skipping a genuinely new company).
+    Parses the "Date/Time Scraped" column value. Tries several common
+    formats since the exact format used by the main scraper is not
+    guaranteed. Returns a datetime, or None if it cannot be parsed.
+    A None result means the row is treated as recent, to be safe, rather
+    than accidentally skipping a genuinely new company.
     """
     if not raw_value:
         return None
-    raw_value = raw_value.strip()
+    raw_value = str(raw_value).strip()
+
     formats_to_try = (
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d",
         "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %I:%M:%S %p",
         "%d/%m/%Y",
         "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %I:%M:%S %p",
         "%m/%d/%Y",
+        "%d %b %Y",
+        "%d %B %Y",
     )
     for fmt in formats_to_try:
         try:
             return datetime.strptime(raw_value, fmt)
         except ValueError:
             continue
-    return None
+
+    # Last attempt: ISO style strings with extra parts.
+    try:
+        return datetime.fromisoformat(raw_value.replace("Z", ""))
+    except ValueError:
+        return None
 
 
 def process_one_company(sheets_service, browser, i, row):
     """
-    Handles everything for ONE company row: finding website/email and
-    saving the result.
+    Handles everything for ONE company row: finding the website and email
+    and saving the result.
 
     BULLETPROOF: this entire function is called inside a try/except in
     main(), so no matter what unexpected error happens for this one
-    company, it will be logged and the script will move on to the next
-    company instead of stopping.
+    company, it is logged and the script moves on to the next company
+    instead of stopping.
     """
     company_name = row[0] if len(row) > 0 else ""
     current_website = row[1] if len(row) > 1 else ""
@@ -527,37 +538,67 @@ def main():
     data_rows = rows[1:]
     processed_count = 0
     failed_count = 0
+    rows_examined = 0
 
-    # Process bottom-to-top: newest sheet entries are far more likely to
-    # still have gaps (older top rows have already been filled in past
-    # runs), so working from the bottom first targets where gap-filling
-    # is actually needed instead of re-checking already-complete rows.
+    # Process from the bottom of the sheet to the top. The newest entries
+    # are at the bottom and are the ones that still have gaps, so working
+    # from the bottom targets where gap filling is actually needed.
     indexed_rows = list(enumerate(data_rows, start=2))
     indexed_rows.reverse()
 
-    cutoff_date = datetime.now() - timedelta(days=MAX_DAYS_BACK)
-    print(f"Only processing companies added on or after {cutoff_date.date()} (last {MAX_DAYS_BACK} day(s)).")
+    # AMI Dev - Sep 2026 - The cutoff is anchored to the date of the NEWEST
+    # company row in the sheet, not to today's date. Example: if the newest
+    # company was added on 20 Sep and MAX_DAYS_BACK is 2, only rows from
+    # 20 Sep and 19 Sep are processed, then the run stops.
+    parsed_dates = []
+    for r in data_rows:
+        d = parse_scraped_date(r[4] if len(r) > 4 else "")
+        if d is not None:
+            parsed_dates.append(d)
+
+    if parsed_dates:
+        newest_date = max(parsed_dates)
+        newest_day_start = datetime(newest_date.year, newest_date.month, newest_date.day)
+        cutoff_date = newest_day_start - timedelta(days=max(MAX_DAYS_BACK, 1) - 1)
+        print(f"Newest company row is dated {newest_date.date()}. Only processing rows on or after {cutoff_date.date()} ({MAX_DAYS_BACK} day(s) counting the newest day).")
+    else:
+        # AMI Dev - Sep 2026 - Fallback if no date could be read from any row.
+        cutoff_date = datetime.now() - timedelta(days=MAX_DAYS_BACK)
+        print(f"Could not read any dates from the sheet. Falling back to cutoff {cutoff_date.date()}.")
+
+    print(f"Safety limits for this run: {MAX_ROWS_PER_RUN} rows, {MAX_RUN_MINUTES} minutes, {MAX_SECONDS_PER_COMPANY} seconds per company.")
+
+    run_started_at = time.time()
 
     playwright_ctx = sync_playwright().start()
     browser = playwright_ctx.chromium.launch(headless=True)
 
     try:
         for i, row in indexed_rows:
+            # AMI Dev - Sep 2026 - Stop if the row limit or the time limit is reached.
+            if rows_examined >= MAX_ROWS_PER_RUN:
+                print(f"Reached the limit of {MAX_ROWS_PER_RUN} rows for this run. Stopping run here.")
+                break
+            if (time.time() - run_started_at) > MAX_RUN_MINUTES * 60:
+                print(f"Reached the time limit of {MAX_RUN_MINUTES} minutes for this run. Stopping run here.")
+                break
+            rows_examined += 1
+
             scraped_date_raw = row[4] if len(row) > 4 else ""
             scraped_date = parse_scraped_date(scraped_date_raw)
 
             if scraped_date is not None and scraped_date < cutoff_date:
-                print(f"[Row {i}] Reached a company older than {MAX_DAYS_BACK} day(s) (scraped {scraped_date.date()}). Stopping run here.")
+                print(f"[Row {i}] Reached a company older than the cutoff {cutoff_date.date()} (scraped {scraped_date.date()}). Stopping run here.")
                 break
 
             try:
                 if process_one_company(sheets_service, browser, i, row):
                     processed_count += 1
             except BrowserDeadError:
-                # The browser process crashed - restart it and retry
-                # this SAME row once before moving on, so we don't lose
-                # a company just because of a browser hiccup.
-                print(f"  [warn] Browser crashed on row {i} - restarting browser and retrying this row.", file=sys.stderr)
+                # The browser process crashed. Restart it and retry this
+                # SAME row once before moving on, so we do not lose a
+                # company just because of a browser hiccup.
+                print(f"  [warn] Browser crashed on row {i}. Restarting browser and retrying this row.", file=sys.stderr)
                 try:
                     browser.close()
                 except Exception:
@@ -570,9 +611,8 @@ def main():
                     print(f"  [error] Row {i} failed again after browser restart, skipping: {e}", file=sys.stderr)
                     failed_count += 1
             except Exception as e:
-                # Catch-all: absolutely anything unexpected on this one
-                # company gets logged, and the run continues to the
-                # next company no matter what.
+                # Catch all: anything unexpected on this one company gets
+                # logged, and the run continues to the next company.
                 print(f"  [error] Unexpected error on row {i} ('{row[0] if row else ''}'), skipping: {e}", file=sys.stderr)
                 failed_count += 1
     finally:
@@ -585,7 +625,8 @@ def main():
         except Exception:
             pass
 
-    print(f"\nDone. Filled gaps for {processed_count} companies this run. {failed_count} companies skipped due to errors.")
+    elapsed_minutes = round((time.time() - run_started_at) / 60, 1)
+    print(f"\nDone in {elapsed_minutes} minutes. Examined {rows_examined} rows. Filled gaps for {processed_count} companies this run. {failed_count} companies skipped due to errors.")
 
 
 if __name__ == "__main__":
