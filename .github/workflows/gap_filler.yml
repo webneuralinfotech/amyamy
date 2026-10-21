@@ -36,4 +36,5 @@ jobs:
           GAP_FILLER_MAX_SECONDS_PER_COMPANY: "120"
           # AMI Dev - Oct 2026 - The run stops only after this many rows older than the cutoff are found one after another.
           GAP_FILLER_STOP_AFTER_OLD_ROWS: "30"
-        run: python gap_filler.py
+        # AMI Dev - Oct 2026 - Added -u so every log line shows live in GitHub instead of appearing in delayed batches.
+        run: python -u gap_filler.py
