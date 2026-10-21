@@ -7,7 +7,8 @@ jobs:
   fill-gaps:
     runs-on: ubuntu-latest
     # AMI Dev - Sep 2026 - Timeout cut from 350 to 60 minutes so GitHub kills the run itself if anything goes wrong, protecting the free Actions minutes.
-    timeout-minutes: 60
+    # AMI Dev - Oct 2026 - Raised from 60 to 130 minutes so it sits above the script's own 120 minute stop, leaving room for setup and the last company.
+    timeout-minutes: 130
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,9 +28,11 @@ jobs:
           # AMI Dev - Oct 2026 - Changed from 2 to 10 days. Counts the newest company day as day one and goes back 10 days in total.
           GAP_FILLER_MAX_DAYS_BACK: "10"
           # AMI Dev - Sep 2026 - Hard safety limits, also enforced inside gap_filler.py.
-          # AMI Dev - Oct 2026 - The 250 limit now counts only companies actually searched, not every row looked at.
-          GAP_FILLER_MAX_ROWS_PER_RUN: "250"
-          GAP_FILLER_MAX_RUN_MINUTES: "50"
+          # AMI Dev - Oct 2026 - The companies limit now counts only companies actually searched, not every row looked at.
+          # AMI Dev - Oct 2026 - Raised from 250 to 600 companies so the run is not cut short before the 2 hour limit.
+          GAP_FILLER_MAX_ROWS_PER_RUN: "600"
+          # AMI Dev - Oct 2026 - Raised from 50 to 120 minutes. The script stops itself after 2 hours.
+          GAP_FILLER_MAX_RUN_MINUTES: "120"
           GAP_FILLER_MAX_SECONDS_PER_COMPANY: "120"
           # AMI Dev - Oct 2026 - The run stops only after this many rows older than the cutoff are found one after another.
           GAP_FILLER_STOP_AFTER_OLD_ROWS: "30"
