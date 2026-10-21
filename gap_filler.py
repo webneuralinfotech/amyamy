@@ -1,6 +1,7 @@
 """
 Company Gap Filler
 AMI Dev - Sep 2026 - Full rewrite with hard run limits.
+AMI Dev - Oct 2026 - Covers 10 days back, safe date reading, no early stop, checked marker in column G.
 
 Goes through the Google Sheet and finds rows where Website or Email is
 missing (says "N/A" or "Not found"). For each of those, searches Google
@@ -16,7 +17,8 @@ Two stage reading of each page:
      the real content does not exist in the raw HTML at all.
 
 Sheet column order must match: Company Name | Website | Email |
-Internship URL | Date/Time Scraped | Internshala Company Page
+Internship URL | Date/Time Scraped | Internshala Company Page |
+Gap Filler Checked
 
 BULLETPROOF BEHAVIOUR (kept from the earlier version):
   Saving to Google Sheets retries 3 times before giving up on one row.
@@ -25,15 +27,29 @@ BULLETPROOF BEHAVIOUR (kept from the earlier version):
   If the browser crashes, it is restarted automatically.
   Website search and page fetches get one automatic retry.
 
-AMI Dev - Sep 2026 - WHAT CHANGED IN THIS VERSION:
+AMI Dev - Sep 2026 - WHAT CHANGED IN THE SEP VERSION:
   1. The date cutoff is anchored to the date of the NEWEST company row
-     in the sheet, not to today's date. Example: newest company was
-     added on 20 Sep and MAX_DAYS_BACK is 2, so only 20 Sep and 19 Sep
-     rows are processed, then the run stops.
-  2. A hard limit on how many rows a run may examine.
+     in the sheet, not to today's date.
+  2. A hard limit on how many companies a run may search.
   3. A hard limit on total run minutes.
   4. A time limit per company so one slow site cannot eat the run.
   5. More date formats are understood when reading Date/Time Scraped.
+
+AMI Dev - Oct 2026 - WHAT CHANGED IN THIS VERSION:
+  1. Default days back raised from 2 to 10.
+  2. Dates that could be read two ways (day/month or month/day) now use
+     the reading that is not in the future, preferring the more recent
+     one. A wrongly read future date can no longer make every real row
+     look old and stop the run after a few rows.
+  3. Reaching one old row no longer stops the run. Old rows are skipped,
+     and the run only stops after STOP_AFTER_OLD_ROWS old rows in a row.
+  4. The row limit now counts only companies actually searched, not
+     every row looked at, so complete rows do not use up the limit.
+  5. After a company is searched, today's date is written in column G
+     (Gap Filler Checked). Rows with a value in column G are never
+     searched again, which protects Serper credits now that the run
+     covers 10 days. Rows that hit an error are not marked, so they are
+     retried on the next run.
 """
 
 import os
@@ -62,19 +78,30 @@ PLAYWRIGHT_TIMEOUT_MS = 15000
 MAX_RETRIES = 3
 RETRY_WAIT_SECONDS = 5
 
-# AMI Dev - Sep 2026 - Number of days to cover, counting the day of the
-# newest company row as day one. With the value 2, the newest day and the
-# day before it are processed, then the run stops.
-MAX_DAYS_BACK = int(os.environ.get("GAP_FILLER_MAX_DAYS_BACK", "2"))
+# AMI Dev - Oct 2026 - Default raised from 2 to 10 days. Counts the day of
+# the newest company row as day one. The yml value overrides this default.
+MAX_DAYS_BACK = int(os.environ.get("GAP_FILLER_MAX_DAYS_BACK", "10"))
 
 # AMI Dev - Sep 2026 - Hard safety limits so a run can never go on for hours.
-# Rows are counted as examined even when they need no gap filling.
+# AMI Dev - Oct 2026 - MAX_ROWS_PER_RUN now counts only companies actually
+# searched (rows with gaps), not every row looked at.
 MAX_ROWS_PER_RUN = int(os.environ.get("GAP_FILLER_MAX_ROWS_PER_RUN", "250"))
 MAX_RUN_MINUTES = int(os.environ.get("GAP_FILLER_MAX_RUN_MINUTES", "50"))
 
 # AMI Dev - Sep 2026 - Maximum seconds spent crawling one company website
 # before giving up on it and moving to the next company.
 MAX_SECONDS_PER_COMPANY = int(os.environ.get("GAP_FILLER_MAX_SECONDS_PER_COMPANY", "120"))
+
+# AMI Dev - Oct 2026 - The run only stops when this many rows older than
+# the cutoff are found one after another. A single odd or old row in the
+# middle of new rows no longer ends the run.
+STOP_AFTER_OLD_ROWS = int(os.environ.get("GAP_FILLER_STOP_AFTER_OLD_ROWS", "30"))
+
+# AMI Dev - Oct 2026 - Column G is used to record that a row was already
+# searched, so it is never searched again.
+CHECKED_COLUMN_LETTER = "G"
+CHECKED_COLUMN_INDEX = 6
+CHECKED_COLUMN_HEADER = "Gap Filler Checked"
 
 HEADERS = {
     "User-Agent": (
@@ -133,11 +160,38 @@ def get_sheets_service():
 
 
 def get_all_rows(sheets_service):
+    # AMI Dev - Oct 2026 - Range widened from A to F up to A to G so the
+    # Gap Filler Checked column is read too.
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB_NAME}!A1:F",
+        range=f"{SHEET_TAB_NAME}!A1:G",
     ).execute()
     return result.get("values", [])
+
+
+def write_cell_range_with_retry(sheets_service, cell_range, values, label):
+    """
+    AMI Dev - Oct 2026 - Shared helper that writes values to a sheet range
+    with retries. Used for the website/email save and the checked marker.
+    """
+    body = {"values": values}
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range=f"{SHEET_TAB_NAME}!{cell_range}",
+                valueInputOption="USER_ENTERED",
+                body=body,
+            ).execute()
+            return True
+        except Exception as e:
+            print(f"  [warn] Sheets save failed for {label} (attempt {attempt}/{MAX_RETRIES}): {e}", file=sys.stderr)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_WAIT_SECONDS)
+
+    print(f"  [error] Could not save {label} after {MAX_RETRIES} attempts. Continuing the run.", file=sys.stderr)
+    return False
 
 
 def update_row(sheets_service, row_number, website, email):
@@ -145,29 +199,46 @@ def update_row(sheets_service, row_number, website, email):
     Saves the website and email for one row into the Google Sheet.
 
     BULLETPROOF: retries up to MAX_RETRIES times if the connection to
-    Google drops mid request. Waits a few seconds between attempts to
-    let any temporary network issue clear up. If it still fails after
-    all retries, it logs the failure and lets the script continue to the
-    next company instead of crashing the entire run.
+    Google drops mid request. If it still fails after all retries, it logs
+    the failure and lets the script continue to the next company instead
+    of crashing the entire run.
     """
-    body = {"values": [[website, email]]}
+    return write_cell_range_with_retry(
+        sheets_service,
+        f"B{row_number}:C{row_number}",
+        [[website, email]],
+        f"row {row_number} website and email",
+    )
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            sheets_service.spreadsheets().values().update(
-                spreadsheetId=SHEET_ID,
-                range=f"{SHEET_TAB_NAME}!B{row_number}:C{row_number}",
-                valueInputOption="USER_ENTERED",
-                body=body,
-            ).execute()
-            return True
-        except Exception as e:
-            print(f"  [warn] Sheets save failed for row {row_number} (attempt {attempt}/{MAX_RETRIES}): {e}", file=sys.stderr)
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_WAIT_SECONDS)
 
-    print(f"  [error] Could not save row {row_number} after {MAX_RETRIES} attempts. Skipping this row and continuing the run.", file=sys.stderr)
-    return False
+def mark_row_checked(sheets_service, row_number):
+    """
+    AMI Dev - Oct 2026 - Writes today's date into column G of this row so
+    the gap filler never searches this company again on later runs.
+    """
+    today_text = datetime.now().strftime("%Y-%m-%d")
+    return write_cell_range_with_retry(
+        sheets_service,
+        f"{CHECKED_COLUMN_LETTER}{row_number}",
+        [[today_text]],
+        f"row {row_number} checked marker",
+    )
+
+
+def ensure_checked_header(sheets_service, header_row):
+    """
+    AMI Dev - Oct 2026 - Adds the "Gap Filler Checked" title to cell G1
+    if that cell is empty. Never changes any other header cell.
+    """
+    current_value = header_row[CHECKED_COLUMN_INDEX] if len(header_row) > CHECKED_COLUMN_INDEX else ""
+    if str(current_value).strip():
+        return
+    write_cell_range_with_retry(
+        sheets_service,
+        f"{CHECKED_COLUMN_LETTER}1",
+        [[CHECKED_COLUMN_HEADER]],
+        "header cell G1",
+    )
 
 
 def search_company_website(company_name):
@@ -437,11 +508,16 @@ def find_email_on_site(website_url, browser):
 
 def parse_scraped_date(raw_value):
     """
-    Parses the "Date/Time Scraped" column value. Tries several common
-    formats since the exact format used by the main scraper is not
-    guaranteed. Returns a datetime, or None if it cannot be parsed.
-    A None result means the row is treated as recent, to be safe, rather
-    than accidentally skipping a genuinely new company.
+    Parses the "Date/Time Scraped" column value. Returns a datetime, or
+    None if it cannot be read. A None result means the row is treated as
+    recent, to be safe, rather than accidentally skipping a new company.
+
+    AMI Dev - Oct 2026 - Every known format is tried, not just the first
+    one that works. A value like 10/12/2026 can mean 10 December or
+    12 October. Readings that land in the future are thrown away, and of
+    the readings left, the most recent one is used. This stops a wrongly
+    read future date from making every real row look old, and it never
+    makes a new company look older than it really is.
     """
     if not raw_value:
         return None
@@ -457,28 +533,50 @@ def parse_scraped_date(raw_value):
         "%d/%m/%Y %I:%M:%S %p",
         "%d/%m/%Y",
         "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
         "%m/%d/%Y %I:%M:%S %p",
         "%m/%d/%Y",
         "%d %b %Y",
         "%d %B %Y",
     )
+
+    readings = []
     for fmt in formats_to_try:
         try:
-            return datetime.strptime(raw_value, fmt)
+            readings.append(datetime.strptime(raw_value, fmt))
         except ValueError:
             continue
 
     # Last attempt: ISO style strings with extra parts.
     try:
-        return datetime.fromisoformat(raw_value.replace("Z", ""))
+        iso_value = datetime.fromisoformat(raw_value.replace("Z", ""))
+        readings.append(iso_value.replace(tzinfo=None))
     except ValueError:
+        pass
+
+    if not readings:
         return None
+
+    # AMI Dev - Oct 2026 - Allow one day of leeway for time zone differences
+    # between the scrapers and the GitHub server, then drop future readings.
+    latest_allowed = datetime.now() + timedelta(days=1)
+    valid_readings = [d for d in readings if d <= latest_allowed]
+
+    if not valid_readings:
+        return None
+
+    return max(valid_readings)
 
 
 def process_one_company(sheets_service, browser, i, row):
     """
     Handles everything for ONE company row: finding the website and email
     and saving the result.
+
+    AMI Dev - Oct 2026 - Now returns a status word instead of True/False:
+      "no_gaps"   row is complete or has no company name, nothing searched
+      "updated"   a website or email was found and saved
+      "no_change" the company was searched but nothing new was found
 
     BULLETPROOF: this entire function is called inside a try/except in
     main(), so no matter what unexpected error happens for this one
@@ -493,7 +591,7 @@ def process_one_company(sheets_service, browser, i, row):
     email_missing = current_email in ("", "Not found")
 
     if not company_name or (not website_missing and not email_missing):
-        return False
+        return "no_gaps"
 
     print(f"[Row {i}] Filling gaps for '{company_name}' (website_missing={website_missing}, email_missing={email_missing})")
 
@@ -516,15 +614,15 @@ def process_one_company(sheets_service, browser, i, row):
         else:
             print(f"  [not found] No email found across site for '{company_name}'")
 
-    updated = False
+    status = "no_change"
     if new_website != current_website or new_email != current_email:
         saved = update_row(sheets_service, i, new_website or "N/A", new_email or "Not found")
         if saved:
             print(f"  [updated] Row {i} saved.")
-            updated = True
+            status = "updated"
 
     time.sleep(REQUEST_DELAY_SECONDS)
-    return updated
+    return status
 
 
 def main():
@@ -535,10 +633,17 @@ def main():
         print("No data rows found in sheet.")
         return
 
+    # AMI Dev - Oct 2026 - Make sure column G has its title in row 1.
+    ensure_checked_header(sheets_service, rows[0])
+
     data_rows = rows[1:]
     processed_count = 0
     failed_count = 0
     rows_examined = 0
+    companies_searched = 0
+    already_checked_count = 0
+    old_rows_skipped = 0
+    consecutive_old_rows = 0
 
     # Process from the bottom of the sheet to the top. The newest entries
     # are at the bottom and are the ones that still have gaps, so working
@@ -547,9 +652,9 @@ def main():
     indexed_rows.reverse()
 
     # AMI Dev - Sep 2026 - The cutoff is anchored to the date of the NEWEST
-    # company row in the sheet, not to today's date. Example: if the newest
-    # company was added on 20 Sep and MAX_DAYS_BACK is 2, only rows from
-    # 20 Sep and 19 Sep are processed, then the run stops.
+    # company row in the sheet, not to today's date.
+    # AMI Dev - Oct 2026 - Future dates are now ignored by parse_scraped_date,
+    # so one wrongly read date can no longer push the cutoff into the future.
     parsed_dates = []
     for r in data_rows:
         d = parse_scraped_date(r[4] if len(r) > 4 else "")
@@ -566,7 +671,7 @@ def main():
         cutoff_date = datetime.now() - timedelta(days=MAX_DAYS_BACK)
         print(f"Could not read any dates from the sheet. Falling back to cutoff {cutoff_date.date()}.")
 
-    print(f"Safety limits for this run: {MAX_ROWS_PER_RUN} rows, {MAX_RUN_MINUTES} minutes, {MAX_SECONDS_PER_COMPANY} seconds per company.")
+    print(f"Safety limits for this run: {MAX_ROWS_PER_RUN} companies searched, {MAX_RUN_MINUTES} minutes, {MAX_SECONDS_PER_COMPANY} seconds per company, stop after {STOP_AFTER_OLD_ROWS} old rows in a row.")
 
     run_started_at = time.time()
 
@@ -575,25 +680,38 @@ def main():
 
     try:
         for i, row in indexed_rows:
-            # AMI Dev - Sep 2026 - Stop if the row limit or the time limit is reached.
-            if rows_examined >= MAX_ROWS_PER_RUN:
-                print(f"Reached the limit of {MAX_ROWS_PER_RUN} rows for this run. Stopping run here.")
+            # AMI Dev - Oct 2026 - The limit now counts companies actually searched.
+            if companies_searched >= MAX_ROWS_PER_RUN:
+                print(f"Reached the limit of {MAX_ROWS_PER_RUN} companies searched for this run. Remaining rows will be picked up on the next run.")
                 break
             if (time.time() - run_started_at) > MAX_RUN_MINUTES * 60:
-                print(f"Reached the time limit of {MAX_RUN_MINUTES} minutes for this run. Stopping run here.")
+                print(f"Reached the time limit of {MAX_RUN_MINUTES} minutes for this run. Remaining rows will be picked up on the next run.")
                 break
             rows_examined += 1
 
             scraped_date_raw = row[4] if len(row) > 4 else ""
             scraped_date = parse_scraped_date(scraped_date_raw)
 
+            # AMI Dev - Oct 2026 - An old row is skipped instead of ending the run.
+            # The run only stops after STOP_AFTER_OLD_ROWS old rows in a row.
             if scraped_date is not None and scraped_date < cutoff_date:
-                print(f"[Row {i}] Reached a company older than the cutoff {cutoff_date.date()} (scraped {scraped_date.date()}). Stopping run here.")
-                break
+                old_rows_skipped += 1
+                consecutive_old_rows += 1
+                if consecutive_old_rows >= STOP_AFTER_OLD_ROWS:
+                    print(f"[Row {i}] Found {STOP_AFTER_OLD_ROWS} rows in a row older than the cutoff {cutoff_date.date()}. Stopping run here.")
+                    break
+                continue
+            consecutive_old_rows = 0
 
+            # AMI Dev - Oct 2026 - Skip rows already searched on an earlier run.
+            checked_value = row[CHECKED_COLUMN_INDEX] if len(row) > CHECKED_COLUMN_INDEX else ""
+            if str(checked_value).strip():
+                already_checked_count += 1
+                continue
+
+            result = None
             try:
-                if process_one_company(sheets_service, browser, i, row):
-                    processed_count += 1
+                result = process_one_company(sheets_service, browser, i, row)
             except BrowserDeadError:
                 # The browser process crashed. Restart it and retry this
                 # SAME row once before moving on, so we do not lose a
@@ -605,8 +723,7 @@ def main():
                     pass
                 browser = playwright_ctx.chromium.launch(headless=True)
                 try:
-                    if process_one_company(sheets_service, browser, i, row):
-                        processed_count += 1
+                    result = process_one_company(sheets_service, browser, i, row)
                 except Exception as e:
                     print(f"  [error] Row {i} failed again after browser restart, skipping: {e}", file=sys.stderr)
                     failed_count += 1
@@ -615,6 +732,15 @@ def main():
                 # logged, and the run continues to the next company.
                 print(f"  [error] Unexpected error on row {i} ('{row[0] if row else ''}'), skipping: {e}", file=sys.stderr)
                 failed_count += 1
+
+            # AMI Dev - Oct 2026 - Count the search and mark the row as checked
+            # in column G. Rows that errored are not marked, so they are
+            # retried on the next run.
+            if result in ("updated", "no_change"):
+                companies_searched += 1
+                if result == "updated":
+                    processed_count += 1
+                mark_row_checked(sheets_service, i)
     finally:
         try:
             browser.close()
@@ -626,7 +752,7 @@ def main():
             pass
 
     elapsed_minutes = round((time.time() - run_started_at) / 60, 1)
-    print(f"\nDone in {elapsed_minutes} minutes. Examined {rows_examined} rows. Filled gaps for {processed_count} companies this run. {failed_count} companies skipped due to errors.")
+    print(f"\nDone in {elapsed_minutes} minutes. Examined {rows_examined} rows. Searched {companies_searched} companies. Filled gaps for {processed_count} companies. Skipped {already_checked_count} rows already checked earlier and {old_rows_skipped} rows older than the cutoff. {failed_count} companies skipped due to errors.")
 
 
 if __name__ == "__main__":
