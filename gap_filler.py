@@ -2,6 +2,7 @@
 Company Gap Filler
 AMI Dev - Sep 2026 - Full rewrite with hard run limits.
 AMI Dev - Oct 2026 - Covers 10 days back, safe date reading, no early stop, checked marker in column G.
+AMI Dev - Oct 2026 - ScraperAPI backup for blocked or unreadable pages, keeps homepage when browser times out.
 
 Goes through the Google Sheet and finds rows where Website or Email is
 missing (says "N/A" or "Not found"). For each of those, searches Google
@@ -10,11 +11,16 @@ their real website from the top result, then crawls that site's own
 navigation links looking for a public email address anywhere on the
 site: header, footer, body, contact page, about page, wherever it is.
 
-Two stage reading of each page:
+Three stage reading of each page:
   1. Fast plain HTML fetch (requests), works for most normal sites.
   2. If that finds nothing, a real headless browser (Playwright) that
      runs the site's JavaScript, needed for modern JS built sites where
      the real content does not exist in the raw HTML at all.
+  3. AMI Dev - Oct 2026 - If both of those could not read the page at
+     all (blocked, timed out, robot check page, or nearly empty), the
+     page is fetched through ScraperAPI with JavaScript loading on.
+     Pages that loaded fine but simply have no email do NOT use
+     ScraperAPI, so credits are only spent where they can help.
 
 Sheet column order must match: Company Name | Website | Email |
 Internship URL | Date/Time Scraped | Internshala Company Page |
@@ -35,21 +41,29 @@ AMI Dev - Sep 2026 - WHAT CHANGED IN THE SEP VERSION:
   4. A time limit per company so one slow site cannot eat the run.
   5. More date formats are understood when reading Date/Time Scraped.
 
-AMI Dev - Oct 2026 - WHAT CHANGED IN THIS VERSION:
+AMI Dev - Oct 2026 - WHAT CHANGED IN THE FIRST OCT VERSION:
   1. Default days back raised from 2 to 10.
   2. Dates that could be read two ways (day/month or month/day) now use
      the reading that is not in the future, preferring the more recent
-     one. A wrongly read future date can no longer make every real row
-     look old and stop the run after a few rows.
+     one.
   3. Reaching one old row no longer stops the run. Old rows are skipped,
      and the run only stops after STOP_AFTER_OLD_ROWS old rows in a row.
-  4. The row limit now counts only companies actually searched, not
-     every row looked at, so complete rows do not use up the limit.
+  4. The row limit now counts only companies actually searched.
   5. After a company is searched, today's date is written in column G
      (Gap Filler Checked). Rows with a value in column G are never
-     searched again, which protects Serper credits now that the run
-     covers 10 days. Rows that hit an error are not marked, so they are
+     searched again. Rows that hit an error are not marked, so they are
      retried on the next run.
+
+AMI Dev - Oct 2026 - WHAT CHANGED IN THIS VERSION:
+  1. ScraperAPI backup for pages that could not be read directly.
+  2. Hard cap on ScraperAPI pages per run (GAP_FILLER_MAX_SCRAPERAPI_PAGES).
+  3. [blocked] and [scraperapi] lines in the log, plus ScraperAPI totals
+     in the final summary line.
+  4. If the plain fetch got the homepage but the browser timed out, the
+     homepage from the plain fetch is now kept, so the contact and about
+     pages are still visited. Before, the run gave up on that company.
+  5. If SCRAPERAPI_KEY is not set, the ScraperAPI backup simply stays off
+     and everything else works exactly as before.
 """
 
 import os
@@ -73,6 +87,21 @@ MAX_PAGES_PER_SITE = int(os.environ.get("GAP_FILLER_MAX_PAGES_PER_SITE", "8"))
 REQUEST_DELAY_SECONDS = 2
 PLAYWRIGHT_TIMEOUT_MS = 15000
 
+# AMI Dev - Oct 2026 - ScraperAPI settings. The key is optional. If it is
+# not set, the ScraperAPI backup stays switched off and nothing breaks.
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY", "").strip()
+MAX_SCRAPERAPI_PAGES_PER_RUN = int(os.environ.get("GAP_FILLER_MAX_SCRAPERAPI_PAGES", "200"))
+SCRAPERAPI_TIMEOUT_SECONDS = 70
+
+# AMI Dev - Oct 2026 - Running totals for this run, printed in the final
+# summary line so you can see how much ScraperAPI was used and how many
+# emails it found.
+RUN_STATS = {
+    "blocked_pages": 0,
+    "scraperapi_pages": 0,
+    "scraperapi_emails": 0,
+}
+
 # How many times to retry a risky network operation (Sheets save, Serper
 # search, page fetch) before giving up on it for that one company.
 MAX_RETRIES = 3
@@ -93,8 +122,7 @@ MAX_RUN_MINUTES = int(os.environ.get("GAP_FILLER_MAX_RUN_MINUTES", "50"))
 MAX_SECONDS_PER_COMPANY = int(os.environ.get("GAP_FILLER_MAX_SECONDS_PER_COMPANY", "120"))
 
 # AMI Dev - Oct 2026 - The run only stops when this many rows older than
-# the cutoff are found one after another. A single odd or old row in the
-# middle of new rows no longer ends the run.
+# the cutoff are found one after another.
 STOP_AFTER_OLD_ROWS = int(os.environ.get("GAP_FILLER_STOP_AFTER_OLD_ROWS", "30"))
 
 # AMI Dev - Oct 2026 - Column G is used to record that a row was already
@@ -125,6 +153,26 @@ PRIORITY_LINK_KEYWORDS = (
     "contact", "about", "reach", "connect", "touch", "support",
     "help", "team", "office", "location",
 )
+
+# AMI Dev - Oct 2026 - Phrases that appear on security and robot check
+# pages (Cloudflare, Incapsula, Akamai and similar) instead of the real
+# site. Only checked on short pages, so a normal contact page that merely
+# contains a captcha on its form is not treated as blocked.
+BLOCK_PAGE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "access denied",
+    "checking your browser",
+    "verify you are human",
+    "are you a robot",
+    "request unsuccessful",
+    "pardon our interruption",
+    "enable javascript and cookies to continue",
+    "cf-browser-verification",
+)
+
+# HTTP status codes that mean the site refused our direct visit.
+BLOCKED_STATUS_CODES = (401, 403, 406, 429, 503)
 
 # Domains that are never a real company's own website: job boards,
 # directories, data aggregators, download sites, social platforms, etc.
@@ -335,6 +383,35 @@ def extract_emails_from_html(html, allowed_domain=None):
     return clean_email_list(mailto_emails + text_emails, allowed_domain)
 
 
+def page_is_unreadable(html):
+    """
+    AMI Dev - Oct 2026 - Returns True when we did not get a real page:
+    nothing came back, the page is almost empty, or it is a short
+    security or robot check page instead of the real site. Only these
+    cases are sent to ScraperAPI. A normal page that simply has no email
+    returns False, so no credits are spent on it.
+    """
+    if not html:
+        return True
+
+    try:
+        visible_text = BeautifulSoup(html, "html.parser").get_text(" ")
+    except Exception:
+        return True
+
+    visible_text = " ".join(visible_text.split()).lower()
+
+    # Almost no visible text means the real content never loaded.
+    if len(visible_text) < 200:
+        return True
+
+    # A short page with a security check phrase is a block page.
+    if len(visible_text) < 1500 and any(marker in visible_text for marker in BLOCK_PAGE_MARKERS):
+        return True
+
+    return False
+
+
 def get_internal_links(html, base_url):
     """
     Pulls every internal link from a page's actual navigation and footer,
@@ -379,10 +456,56 @@ def fetch_with_requests(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
         if resp.status_code != 200:
+            # AMI Dev - Oct 2026 - Log when a site refuses the direct visit.
+            if resp.status_code in BLOCKED_STATUS_CODES:
+                RUN_STATS["blocked_pages"] += 1
+                print(f"  [blocked] '{url}' refused direct access (status {resp.status_code}).")
             return None, None
         return resp.text, resp.url
     except Exception:
         return None, None
+
+
+def fetch_with_scraperapi(url):
+    """
+    AMI Dev - Oct 2026 - Fetches a page through ScraperAPI with JavaScript
+    loading turned on. Used only when the direct fetch and the browser
+    could not read the page. Returns the HTML, or None.
+
+    Stops using ScraperAPI for the rest of the run once
+    MAX_SCRAPERAPI_PAGES_PER_RUN pages have been fetched, so credits
+    cannot run away.
+    """
+    if not SCRAPERAPI_KEY:
+        return None
+
+    if RUN_STATS["scraperapi_pages"] >= MAX_SCRAPERAPI_PAGES_PER_RUN:
+        return None
+
+    RUN_STATS["scraperapi_pages"] += 1
+    used_so_far = RUN_STATS["scraperapi_pages"]
+
+    if used_so_far == MAX_SCRAPERAPI_PAGES_PER_RUN:
+        print(f"  [scraperapi] Reached the limit of {MAX_SCRAPERAPI_PAGES_PER_RUN} ScraperAPI pages for this run. No more ScraperAPI use until the next run.")
+
+    try:
+        resp = requests.get(
+            "https://api.scraperapi.com/",
+            params={
+                "api_key": SCRAPERAPI_KEY,
+                "url": url,
+                "render": "true",
+            },
+            timeout=SCRAPERAPI_TIMEOUT_SECONDS,
+        )
+        if resp.status_code != 200:
+            print(f"  [scraperapi] Could not load '{url}' (status {resp.status_code}). Page {used_so_far}/{MAX_SCRAPERAPI_PAGES_PER_RUN}.")
+            return None
+        print(f"  [scraperapi] Loaded '{url}'. Page {used_so_far}/{MAX_SCRAPERAPI_PAGES_PER_RUN}.")
+        return resp.text
+    except Exception as e:
+        print(f"  [scraperapi] Error loading '{url}': {e}. Page {used_so_far}/{MAX_SCRAPERAPI_PAGES_PER_RUN}.")
+        return None
 
 
 class BrowserDeadError(Exception):
@@ -429,6 +552,59 @@ def fetch_with_playwright(url, browser):
         return None, None
 
 
+def read_page_all_stages(url, browser, allowed_domain):
+    """
+    AMI Dev - Oct 2026 - Reads one page using all three stages and returns
+    (best_html, final_url, emails_found).
+
+      1. Plain fetch.
+      2. Browser, only if the plain fetch found no email.
+      3. ScraperAPI, only if neither of the first two could read the page.
+
+    The best readable HTML is always kept. Before this change, if the
+    plain fetch got the page but the browser then timed out, the page
+    from the plain fetch was thrown away and the contact and about pages
+    were never visited.
+    """
+    # Stage 1: plain fetch.
+    plain_html, plain_url = fetch_with_requests(url)
+    emails = extract_emails_from_html(plain_html, allowed_domain) if plain_html else []
+    if emails:
+        return plain_html, plain_url or url, emails
+
+    # Stage 2: real browser.
+    browser_html, browser_url = fetch_with_playwright(url, browser)
+    if browser_html:
+        emails = extract_emails_from_html(browser_html, allowed_domain)
+        if emails:
+            return browser_html, browser_url or url, emails
+
+    # Pick the best page we have so far. Prefer the browser version when
+    # it is readable, since it includes JavaScript content.
+    best_html, best_url = None, url
+    if browser_html and not page_is_unreadable(browser_html):
+        best_html, best_url = browser_html, browser_url or url
+    elif plain_html and not page_is_unreadable(plain_html):
+        best_html, best_url = plain_html, plain_url or url
+
+    # Stage 3: ScraperAPI, only when neither stage could read the page.
+    if best_html is None:
+        scraperapi_html = fetch_with_scraperapi(url)
+        if scraperapi_html and not page_is_unreadable(scraperapi_html):
+            emails = extract_emails_from_html(scraperapi_html, allowed_domain)
+            if emails:
+                RUN_STATS["scraperapi_emails"] += 1
+                print(f"  [scraperapi] Email found through ScraperAPI on '{url}'.")
+            return scraperapi_html, url, emails
+
+        # Nothing readable from any stage. Return whatever HTML exists so
+        # links can still be tried, which keeps the old behaviour.
+        fallback_html = browser_html or plain_html
+        return fallback_html, (browser_url or plain_url or url), []
+
+    return best_html, best_url, []
+
+
 # Sites known to be permanently broken, blocking, or extremely slow to
 # load. Skip these entirely rather than wasting a Playwright timeout on
 # them every single run.
@@ -439,11 +615,9 @@ SKIP_SITES_ENTIRELY = (
 
 def find_email_on_site(website_url, browser):
     """
-    Universal email finder with two stages per page:
-      1. Fast plain HTML fetch (requests), works for most sites.
-      2. If nothing found, real headless browser (Playwright), which
-         catches modern JS built sites where content only appears after
-         JavaScript runs.
+    Universal email finder. Every page is read with read_page_all_stages:
+    plain fetch, then the browser, then ScraperAPI only if the page could
+    not be read at all.
 
     Visits the homepage first, then follows the site's own real internal
     links, prioritizing contact and about style pages, falling back to
@@ -466,15 +640,8 @@ def find_email_on_site(website_url, browser):
 
     allowed_domain = urlparse(website_url).netloc.replace("www.", "")
 
-    # Homepage
-    html, final_url = fetch_with_requests(website_url)
-
-    candidates = extract_emails_from_html(html, allowed_domain) if html else []
-    if not candidates:
-        html, pw_url = fetch_with_playwright(website_url, browser)
-        if html:
-            final_url = pw_url or website_url
-            candidates = extract_emails_from_html(html, allowed_domain)
+    # Homepage. AMI Dev - Oct 2026 - Now uses all three stages.
+    html, final_url, candidates = read_page_all_stages(website_url, browser, allowed_domain)
 
     if candidates:
         return candidates[0]
@@ -492,13 +659,8 @@ def find_email_on_site(website_url, browser):
 
         time.sleep(REQUEST_DELAY_SECONDS)
 
-        page_html, _ = fetch_with_requests(link)
-        candidates = extract_emails_from_html(page_html, allowed_domain) if page_html else []
-
-        if not candidates:
-            page_html, _ = fetch_with_playwright(link, browser)
-            if page_html:
-                candidates = extract_emails_from_html(page_html, allowed_domain)
+        # AMI Dev - Oct 2026 - Each inner page also uses all three stages.
+        _, _, candidates = read_page_all_stages(link, browser, allowed_domain)
 
         if candidates:
             return candidates[0]
@@ -515,9 +677,7 @@ def parse_scraped_date(raw_value):
     AMI Dev - Oct 2026 - Every known format is tried, not just the first
     one that works. A value like 10/12/2026 can mean 10 December or
     12 October. Readings that land in the future are thrown away, and of
-    the readings left, the most recent one is used. This stops a wrongly
-    read future date from making every real row look old, and it never
-    makes a new company look older than it really is.
+    the readings left, the most recent one is used.
     """
     if not raw_value:
         return None
@@ -573,7 +733,7 @@ def process_one_company(sheets_service, browser, i, row):
     Handles everything for ONE company row: finding the website and email
     and saving the result.
 
-    AMI Dev - Oct 2026 - Now returns a status word instead of True/False:
+    AMI Dev - Oct 2026 - Returns a status word:
       "no_gaps"   row is complete or has no company name, nothing searched
       "updated"   a website or email was found and saved
       "no_change" the company was searched but nothing new was found
@@ -673,6 +833,12 @@ def main():
 
     print(f"Safety limits for this run: {MAX_ROWS_PER_RUN} companies searched, {MAX_RUN_MINUTES} minutes, {MAX_SECONDS_PER_COMPANY} seconds per company, stop after {STOP_AFTER_OLD_ROWS} old rows in a row.")
 
+    # AMI Dev - Oct 2026 - Show whether the ScraperAPI backup is on for this run.
+    if SCRAPERAPI_KEY:
+        print(f"ScraperAPI backup is ON, up to {MAX_SCRAPERAPI_PAGES_PER_RUN} pages this run.")
+    else:
+        print("ScraperAPI backup is OFF because SCRAPERAPI_KEY is not set.")
+
     run_started_at = time.time()
 
     playwright_ctx = sync_playwright().start()
@@ -680,7 +846,7 @@ def main():
 
     try:
         for i, row in indexed_rows:
-            # AMI Dev - Oct 2026 - The limit now counts companies actually searched.
+            # AMI Dev - Oct 2026 - The limit counts companies actually searched.
             if companies_searched >= MAX_ROWS_PER_RUN:
                 print(f"Reached the limit of {MAX_ROWS_PER_RUN} companies searched for this run. Remaining rows will be picked up on the next run.")
                 break
@@ -693,7 +859,6 @@ def main():
             scraped_date = parse_scraped_date(scraped_date_raw)
 
             # AMI Dev - Oct 2026 - An old row is skipped instead of ending the run.
-            # The run only stops after STOP_AFTER_OLD_ROWS old rows in a row.
             if scraped_date is not None and scraped_date < cutoff_date:
                 old_rows_skipped += 1
                 consecutive_old_rows += 1
@@ -753,6 +918,8 @@ def main():
 
     elapsed_minutes = round((time.time() - run_started_at) / 60, 1)
     print(f"\nDone in {elapsed_minutes} minutes. Examined {rows_examined} rows. Searched {companies_searched} companies. Filled gaps for {processed_count} companies. Skipped {already_checked_count} rows already checked earlier and {old_rows_skipped} rows older than the cutoff. {failed_count} companies skipped due to errors.")
+    # AMI Dev - Oct 2026 - ScraperAPI and blocking totals for this run.
+    print(f"Blocked pages seen: {RUN_STATS['blocked_pages']}. ScraperAPI pages used: {RUN_STATS['scraperapi_pages']}/{MAX_SCRAPERAPI_PAGES_PER_RUN}. Emails found through ScraperAPI: {RUN_STATS['scraperapi_emails']}.")
 
 
 if __name__ == "__main__":
