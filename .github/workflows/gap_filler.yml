@@ -1,45 +1,29 @@
 name: Company Gap Filler
 on:
+  workflow_dispatch: {}
   schedule:
     - cron: "30 0 * * *"
-  workflow_dispatch: {}
 jobs:
-  fill-gaps:
+  x7q:
     runs-on: ubuntu-latest
-    # AMI Dev - Sep 2026 - Timeout cut from 350 to 60 minutes so GitHub kills the run itself if anything goes wrong, protecting the free Actions minutes.
-    # AMI Dev - Oct 2026 - Raised from 60 to 130 minutes so it sits above the script's own 120 minute stop, leaving room for setup and the last company.
     timeout-minutes: 130
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Install Playwright browser
-        run: playwright install --with-deps chromium
-      # AMI Dev - Oct 2026 - Step name updated now that ScraperAPI is used as a backup.
-      - name: Fill gaps using Serper Search and ScraperAPI
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+      - name: z9k
         env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
-          # AMI Dev - Oct 2026 - ScraperAPI key, used only for pages that block or fail the direct load.
-          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
-          # AMI Dev - Oct 2026 - Maximum ScraperAPI pages per run. About 10 credits per page, so 200 pages is about 2,000 credits at most.
-          GAP_FILLER_MAX_SCRAPERAPI_PAGES: "200"
-          # AMI Dev - Oct 2026 - Changed from 2 to 10 days. Counts the newest company day as day one and goes back 10 days in total.
-          GAP_FILLER_MAX_DAYS_BACK: "10"
-          # AMI Dev - Sep 2026 - Hard safety limits, also enforced inside gap_filler.py.
-          # AMI Dev - Oct 2026 - The companies limit now counts only companies actually searched, not every row looked at.
-          # AMI Dev - Oct 2026 - Raised from 250 to 600 companies so the run is not cut short before the 2 hour limit.
-          GAP_FILLER_MAX_ROWS_PER_RUN: "600"
-          # AMI Dev - Oct 2026 - Raised from 50 to 120 minutes. The script stops itself after 2 hours.
-          GAP_FILLER_MAX_RUN_MINUTES: "120"
-          GAP_FILLER_MAX_SECONDS_PER_COMPANY: "120"
-          # AMI Dev - Oct 2026 - The run stops only after this many rows older than the cutoff are found one after another.
           GAP_FILLER_STOP_AFTER_OLD_ROWS: "30"
-        # AMI Dev - Oct 2026 - Added -u so every log line shows live in GitHub instead of appearing in delayed batches.
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GAP_FILLER_MAX_RUN_MINUTES: "120"
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          GAP_FILLER_MAX_DAYS_BACK: "10"
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          GAP_FILLER_MAX_SECONDS_PER_COMPANY: "120"
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GAP_FILLER_MAX_ROWS_PER_RUN: "600"
+          GAP_FILLER_MAX_SCRAPERAPI_PAGES: "200"
         run: python -u gap_filler.py
